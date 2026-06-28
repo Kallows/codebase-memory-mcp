@@ -476,6 +476,13 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
     snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}",
              func->qualified_name ? func->qualified_name : "");
     cbm_gbuf_insert_edge(gb, func->id, route_id, "HANDLES", hprops);
+    if (func->properties_json && strstr(func->properties_json, "\"route_client\"")) {
+        /* Client (Retrofit) route decl: also emit the HTTP_CALLS edge that
+         * cross-repo route matching consumes, so the app links to the server. */
+        char cprops[CBM_SZ_512];
+        snprintf(cprops, sizeof(cprops), "{\"url_path\":\"%s\",\"method\":\"%s\"}", path, method);
+        cbm_gbuf_insert_edge(gb, func->id, route_id, "HTTP_CALLS", cprops);
+    }
     return SKIP_ONE;
 }
 

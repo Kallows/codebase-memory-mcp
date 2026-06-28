@@ -303,6 +303,7 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "route_client", def->route_is_client ? "1" : NULL);
 
     /* MinHash fingerprint — append if present and buffer has room.
      * Hex-encoded K=64 uint32 = 512 chars + key/quotes ≈ 520 chars. */
@@ -515,6 +516,16 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
         cbm_json_escape(esc_h, sizeof(esc_h), def->qualified_name);
         snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
         cbm_gbuf_insert_edge(ws->local_gbuf, func_id, route_id, "HANDLES", hprops);
+        if (def->route_is_client) {
+            /* Retrofit @GET("path") is a *client* call decl, not a server handler:
+             * also emit the HTTP_CALLS edge (url_path/method props) that cross-repo
+             * route matching consumes, so the app links to the server's Route. */
+            char esc_u[CBM_SZ_256];
+            cbm_json_escape(esc_u, sizeof(esc_u), def->route_path);
+            char cprops[CBM_SZ_512];
+            snprintf(cprops, sizeof(cprops), "{\"url_path\":\"%s\",\"method\":\"%s\"}", esc_u, rm);
+            cbm_gbuf_insert_edge(ws->local_gbuf, func_id, route_id, "HTTP_CALLS", cprops);
+        }
     }
 }
 

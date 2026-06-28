@@ -1320,7 +1320,8 @@ static TSNode annotation_args_node(TSNode annotation) {
  *   @GetMapping("/orders")  @RequestMapping(value="/api")  @PostMapping
  * Returns true when the annotation is a route-mapping annotation. */
 static bool try_route_from_annotation(CBMArena *a, TSNode annotation, const char *source,
-                                      const char **out_path, const char **out_method) {
+                                      const char **out_path, const char **out_method,
+                                      bool *out_is_client) {
     TSNode name_node = annotation_name_node(annotation);
     if (ts_node_is_null(name_node)) {
         return false;
@@ -1330,18 +1331,26 @@ static bool try_route_from_annotation(CBMArena *a, TSNode annotation, const char
     if (!method) {
         return false;
     }
+    /* Bare verb annotations (@GET/@POST/...) are the Retrofit/JAX-RS client form
+     * (annotation_route_method returns the name unchanged); Spring uses the
+     * distinct @GetMapping/@RequestMapping names. Treat bare verbs as *client*
+     * call decls so cross-repo matching links them to server Routes. */
+    bool is_bare_verb = (strcmp(name, method) == 0);
     TSNode args = annotation_args_node(annotation);
     const char *path = NULL;
     if (!ts_node_is_null(args)) {
         path = extract_route_path_from_args(a, args, source);
-        if (!path && strcmp(name, method) == 0) {
-            /* Bare verb annotation (@GET/@POST/...) as used by Retrofit clients:
-             * the path is a *relative* string arg the strict extractor drops. */
+        if (!path && is_bare_verb) {
+            /* Retrofit relative path (@GET("api/x")) — the strict extractor drops
+             * leading-'/'-less paths; accept and normalize it. */
             path = extract_relative_route_path_from_args(a, args, source);
         }
     }
     *out_path = path ? path : "/";
     *out_method = method;
+    if (out_is_client) {
+        *out_is_client = is_bare_verb;
+    }
     return true;
 }
 
@@ -1351,14 +1360,14 @@ static bool try_route_from_annotation(CBMArena *a, TSNode annotation, const char
  * as prev-siblings, so the prev-sibling decorator walk never sees them. */
 static bool extract_route_from_annotations(CBMArena *a, TSNode func_node, const char *source,
                                            const CBMLangSpec *spec, const char **out_path,
-                                           const char **out_method) {
+                                           const char **out_method, bool *out_is_client) {
     TSNode modifiers = find_jvm_modifiers(func_node, spec->language);
     if (!ts_node_is_null(modifiers)) {
         uint32_t mc = ts_node_child_count(modifiers);
         for (uint32_t mi = 0; mi < mc; mi++) {
             TSNode mchild = ts_node_child(modifiers, mi);
             if (cbm_kind_in_set(mchild, spec->decorator_node_types) &&
-                try_route_from_annotation(a, mchild, source, out_path, out_method)) {
+                try_route_from_annotation(a, mchild, source, out_path, out_method, out_is_client)) {
                 return true;
             }
         }
@@ -1369,7 +1378,7 @@ static bool extract_route_from_annotations(CBMArena *a, TSNode func_node, const 
     for (uint32_t ci = 0; ci < cc; ci++) {
         TSNode child = ts_node_child(func_node, ci);
         if (cbm_kind_in_set(child, spec->decorator_node_types) &&
-            try_route_from_annotation(a, child, source, out_path, out_method)) {
+            try_route_from_annotation(a, child, source, out_path, out_method, out_is_client)) {
             return true;
         }
     }
@@ -1378,9 +1387,12 @@ static bool extract_route_from_annotations(CBMArena *a, TSNode func_node, const 
 
 static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const char *source,
                                           const CBMLangSpec *spec, const char **out_path,
-                                          const char **out_method) {
+                                          const char **out_method, bool *out_is_client) {
     *out_path = NULL;
     *out_method = NULL;
+    if (out_is_client) {
+        *out_is_client = false;
+    }
 
     if (!spec->decorator_node_types || !spec->decorator_node_types[0]) {
         return;
@@ -1404,7 +1416,7 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
         }
         /* JVM/C# annotation-form route mapping (Spring @GetMapping etc.) — the
          * prev-sibling itself may be the annotation node. */
-        if (try_route_from_annotation(a, prev, source, out_path, out_method)) {
+        if (try_route_from_annotation(a, prev, source, out_path, out_method, out_is_client)) {
             return;
         }
         prev = ts_node_prev_sibling(prev);
@@ -1412,7 +1424,7 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
 
     /* Spring/JAX-RS annotations live inside the method's `modifiers` child, not
      * as prev-siblings — scan there too. */
-    extract_route_from_annotations(a, func_node, source, spec, out_path, out_method);
+    extract_route_from_annotations(a, func_node, source, spec, out_path, out_method, out_is_client);
 }
 
 // Extract decorator names from preceding decorator/annotation nodes
@@ -2810,7 +2822,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
 
     // Decorators + route extraction from decorator AST
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
-    extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method);
+    extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method,
+                                  &def.route_is_client);
 
     // Docstring
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
@@ -3595,7 +3608,8 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, const char *class_
     }
 
     def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);
-    extract_route_from_decorators(a, child, ctx->source, spec, &def.route_path, &def.route_method);
+    extract_route_from_decorators(a, child, ctx->source, spec, &def.route_path, &def.route_method,
+                                  &def.route_is_client);
     def.docstring = extract_docstring(a, child, ctx->source, ctx->language);
 
     if (spec->branching_node_types && spec->branching_node_types[0]) {
