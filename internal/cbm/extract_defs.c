@@ -1123,9 +1123,12 @@ static const char *annotation_route_method(const char *name) {
     if (strcmp(name, "RequestMapping") == 0) {
         return "ANY";
     }
-    /* JAX-RS bare-verb annotations (@GET/@POST/...) — path comes from @Path. */
+    /* JAX-RS / Retrofit bare-verb annotations (@GET/@POST/...). For Retrofit the
+     * path is the annotation's own (relative) string arg; for JAX-RS it may come
+     * from a separate @Path. */
     if (strcmp(name, "GET") == 0 || strcmp(name, "POST") == 0 || strcmp(name, "PUT") == 0 ||
-        strcmp(name, "DELETE") == 0 || strcmp(name, "PATCH") == 0) {
+        strcmp(name, "DELETE") == 0 || strcmp(name, "PATCH") == 0 || strcmp(name, "HEAD") == 0 ||
+        strcmp(name, "OPTIONS") == 0) {
         return name;
     }
     return NULL;
@@ -1182,6 +1185,50 @@ static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const 
                 return path;
             }
         }
+    }
+    return NULL;
+}
+
+/* Like extract_route_path_from_args, but accepts a *relative* path (no leading
+ * '/') and normalizes it to a leading-slash path. Retrofit/JAX-RS clients write
+ * @GET("api/records/{id}") where the path is relative; the strict extractor
+ * above drops those (it requires a leading '/'), so the route would default to
+ * "/". Returns NULL when no string argument is present (a bare @GET whose path
+ * legitimately comes from elsewhere). Only meant for bare verb annotations. */
+static const char *extract_relative_route_path_from_args(CBMArena *a, TSNode args,
+                                                         const char *source) {
+    uint32_t nc = ts_node_named_child_count(args);
+    for (uint32_t ai = 0; ai < nc && ai < DECORATOR_SCAN_LIMIT; ai++) {
+        TSNode arg = ts_node_named_child(args, ai);
+        const char *ak = ts_node_type(arg);
+        /* Kotlin wraps each annotation argument in a `value_argument` node. */
+        if (strcmp(ak, "value_argument") == 0) {
+            TSNode s = cbm_find_child_by_kind(arg, "string_literal");
+            if (ts_node_is_null(s)) {
+                continue;
+            }
+            arg = s;
+            ak = ts_node_type(arg);
+        }
+        if (strcmp(ak, "string") != 0 && strcmp(ak, "string_literal") != 0 &&
+            strcmp(ak, "interpreted_string_literal") != 0) {
+            continue;
+        }
+        char *raw = cbm_node_text(a, arg, source);
+        if (!raw) {
+            continue;
+        }
+        int rlen = (int)strlen(raw);
+        if (rlen >= PAIR_CHARS && (raw[0] == '"' || raw[0] == '\'')) {
+            raw = cbm_arena_strndup(a, raw + SKIP_CHAR, (size_t)(rlen - PAIR_CHARS));
+        }
+        if (!raw || raw[0] == '\0') {
+            continue;
+        }
+        if (raw[0] == '/') {
+            return raw;
+        }
+        return cbm_arena_sprintf(a, "/%s", raw);
     }
     return NULL;
 }
@@ -1287,6 +1334,11 @@ static bool try_route_from_annotation(CBMArena *a, TSNode annotation, const char
     const char *path = NULL;
     if (!ts_node_is_null(args)) {
         path = extract_route_path_from_args(a, args, source);
+        if (!path && strcmp(name, method) == 0) {
+            /* Bare verb annotation (@GET/@POST/...) as used by Retrofit clients:
+             * the path is a *relative* string arg the strict extractor drops. */
+            path = extract_relative_route_path_from_args(a, args, source);
+        }
     }
     *out_path = path ? path : "/";
     *out_method = method;
