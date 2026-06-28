@@ -208,6 +208,87 @@ static int64_t find_route_handler(cbm_store_t *target_store, const char *route_q
     return handler_id;
 }
 
+/* Base-URL reconciliation: a client may omit a path prefix the server mounts
+ * (e.g. a Retrofit baseUrl of ".../api/"), so the canonical client path is a
+ * segment-aligned *suffix* of the server Route QN. Match it that way, requiring
+ * >=2 path segments (so trivial single-segment paths like "/users" don't match
+ * "/api/admin/users") and preferring the shortest (most specific) server route.
+ * Writes the matched server Route QN to out_route_qn. Returns the handler node
+ * id, or 0. NB: '_' in the path acts as a SQL LIKE wildcard — acceptable here. */
+static int64_t find_route_handler_suffix(cbm_store_t *target_store, const char *canon_path,
+                                         const char *method, char *out_route_qn, size_t qn_sz,
+                                         char *handler_name, size_t name_sz, char *handler_file,
+                                         size_t file_sz) {
+    handler_name[0] = '\0';
+    handler_file[0] = '\0';
+    if (!canon_path || canon_path[0] != '/') {
+        return 0;
+    }
+    int segs = 0;
+    for (const char *p = canon_path; *p != '\0'; p++) {
+        if (*p == '/') {
+            segs++;
+        }
+    }
+    if (segs < PAIR_LEN) {
+        return 0; /* too generic to match safely */
+    }
+    struct sqlite3 *db = cbm_store_get_db(target_store);
+    if (!db) {
+        return 0;
+    }
+    /* Leading '/' in canon_path keeps the LIKE suffix segment-aligned. */
+    char like_m[CR_QN_BUF];
+    char like_any[CR_QN_BUF];
+    snprintf(like_m, sizeof(like_m), "__route__%s__%%%s", method[0] ? method : "ANY", canon_path);
+    snprintf(like_any, sizeof(like_any), "__route__ANY__%%%s", canon_path);
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT id, qualified_name FROM nodes WHERE label = 'Route' "
+                           "AND (qualified_name LIKE ?1 OR qualified_name LIKE ?2) "
+                           "ORDER BY length(qualified_name) ASC LIMIT 1",
+                           CBM_NOT_FOUND, &s, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_text(s, SKIP_ONE, like_m, CBM_NOT_FOUND, SQLITE_STATIC);
+    sqlite3_bind_text(s, PAIR_LEN, like_any, CBM_NOT_FOUND, SQLITE_STATIC);
+    int64_t route_id = 0;
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        route_id = sqlite3_column_int64(s, 0);
+        const char *qn = (const char *)sqlite3_column_text(s, SKIP_ONE);
+        if (qn) {
+            snprintf(out_route_qn, qn_sz, "%s", qn);
+        }
+    }
+    sqlite3_finalize(s);
+    if (route_id == 0) {
+        return 0;
+    }
+    /* Follow HANDLES edge to find the handler function. */
+    if (sqlite3_prepare_v2(db,
+                           "SELECT n.id, n.name, n.file_path FROM edges e "
+                           "JOIN nodes n ON n.id = e.source_id "
+                           "WHERE e.target_id = ?1 AND e.type = 'HANDLES' LIMIT 1",
+                           CBM_NOT_FOUND, &s, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_int64(s, SKIP_ONE, route_id);
+    int64_t handler_id = 0;
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        handler_id = sqlite3_column_int64(s, 0);
+        const char *n = (const char *)sqlite3_column_text(s, SKIP_ONE);
+        const char *f = (const char *)sqlite3_column_text(s, PAIR_LEN);
+        if (n) {
+            snprintf(handler_name, name_sz, "%s", n);
+        }
+        if (f) {
+            snprintf(handler_file, file_sz, "%s", f);
+        }
+    }
+    sqlite3_finalize(s);
+    return handler_id;
+}
+
 /* Emit CROSS_* edge for a route match: forward into source, reverse into target. */
 static void emit_cross_route_bidirectional(cbm_store_t *src_store, const char *src_project,
                                            struct sqlite3 *src_db, int64_t caller_id,
@@ -302,6 +383,15 @@ static int match_http_routes(cbm_store_t *src_store, const char *src_project,
             snprintf(route_qn, sizeof(route_qn), "__route__ANY__%s", curl);
             handler_id = find_route_handler(tgt_store, route_qn, handler_name, sizeof(handler_name),
                                             handler_file, sizeof(handler_file));
+        }
+        if (handler_id == 0) {
+            /* Base-URL reconciliation: client may omit a server-mounted path
+             * prefix (Retrofit baseUrl). Match client path as a server-route
+             * suffix; route_qn is rewritten to the matched server QN. */
+            handler_id = find_route_handler_suffix(tgt_store, curl, method, route_qn,
+                                                   sizeof(route_qn), handler_name,
+                                                   sizeof(handler_name), handler_file,
+                                                   sizeof(handler_file));
         }
         if (handler_id == 0) {
             continue;
